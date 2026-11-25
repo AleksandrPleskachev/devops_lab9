@@ -1,0 +1,91 @@
+name: Docker Lab 9
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build and measure images
+        shell: bash
+        run: |
+          set -x
+          e=$RUNNER_TEMP/evidence
+          mkdir -p "$e" tmp
+          dd if=/dev/urandom of=tmp/fixture.bin bs=1M count=2 status=none
+          mv .dockerignore "$RUNNER_TEMP/lab9.ignore"
+          docker build --progress=plain -f Dockerfile.naive -t lab9:raw . > "$e/raw.txt" 2>&1
+          mv "$RUNNER_TEMP/lab9.ignore" .dockerignore
+          docker build --progress=plain -f Dockerfile.naive -t lab9:naive . > "$e/ignored.txt" 2>&1
+          docker build --progress=plain -t lab9:1.0.0 . > "$e/multi.txt" 2>&1
+          for base in scratch gcr.io/distroless/static-debian12:nonroot gcr.io/distroless/base-debian12:nonroot; do
+            case "$base" in scratch) tag=scratch;; *static*) tag=static;; *) tag=base;; esac
+            docker build --progress=plain -f Dockerfile.zones --build-arg BASE="$base" -t "lab9:$tag" . > "$e/build-$tag.txt" 2>&1
+          done
+          { for build in raw ignored multi; do echo "$build context"; grep -A2 'load build context' "$e/$build.txt"; done
+            docker image inspect lab9:raw lab9:naive lab9:1.0.0 lab9:scratch lab9:static lab9:base --format '{{index .RepoTags 0}} {{.Size}} bytes'
+          } | tee "$e/sizes.txt"
+      - name: Verify time zones and health transitions
+        shell: bash
+        run: |
+          exec > >(tee "$RUNNER_TEMP/evidence/checks.txt") 2>&1
+          set -x
+          for tag in raw 1.0.0 scratch static base; do
+            docker run -d --name "time-$tag" -p 127.0.0.1:8080:8080 "lab9:$tag"
+            curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/now | jq -e '.tz == "UTC" and (.time | endswith("Z"))'
+            status=$(curl -sS -o /tmp/zone-result -w '%{http_code}' 'http://127.0.0.1:8080/now?tz=Europe/Moscow')
+            printf '%s Moscow HTTP %s\n' "$tag" "$status"
+            cat /tmp/zone-result
+            if [[ $tag == base || $tag == 1.0.0 ]]; then
+              test "$status" = 200
+              jq -e '.time | endswith("+03:00")' /tmp/zone-result
+            fi
+            docker rm -f "time-$tag"
+          done
+          docker run -d --name lab9-ok lab9:1.0.0
+          docker run -d --name lab9-bad -e HEALTH_FAIL=1 lab9:1.0.0
+          for i in {1..15}; do
+            ok=$(docker inspect -f '{{.State.Health.Status}}' lab9-ok)
+            bad=$(docker inspect -f '{{.State.Health.Status}}' lab9-bad)
+            printf 'normal=%s forced-500=%s\n' "$ok" "$bad"
+            if [[ $ok == healthy && $bad == unhealthy ]]; then break; fi
+            sleep 2
+          done
+          test "$ok" = healthy && test "$bad" = unhealthy
+          docker ps --filter name=lab9-
+          docker inspect -f '{{json .State.Health}}' lab9-bad
+          docker rm -f lab9-ok lab9-bad
+      - name: Tag, publish, pull and verify
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          exec > >(tee "$RUNNER_TEMP/evidence/registry.txt") 2>&1
+          set -x
+          for tag in 1.0 1 latest stable; do docker tag lab9:1.0.0 "lab9:$tag"; done
+          docker images --digests lab9
+          ref="ghcr.io/${GITHUB_REPOSITORY,,}/time-service"
+          for tag in 1.0.0 latest; do
+            docker tag lab9:1.0.0 "$ref:$tag"
+            docker push "$ref:$tag"
+          done
+          docker rmi "$ref:1.0.0" "$ref:latest" lab9:1.0.0 lab9:1.0 lab9:1 lab9:latest lab9:stable
+          docker pull "$ref:1.0.0"
+          docker run -d --name lab9-pulled -p 127.0.0.1:8080:8080 "$ref:1.0.0"
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 'http://127.0.0.1:8080/now?tz=Europe/Moscow' | tee /tmp/lab9-response | jq -e '.time | endswith("+03:00")'
+          cat /tmp/lab9-response
+          docker rm -f lab9-pulled
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-lab9-evidence
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
