@@ -1,0 +1,5 @@
+FROM golang:1.22.12
+WORKDIR /src
+COPY . .
+RUN go build -o /service .
+ENTRYPOINT ["/service"]
